@@ -1,1 +1,4 @@
 /build/
+nimble.develop
+nimble.paths
+nimbledeps
