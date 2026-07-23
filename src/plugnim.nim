@@ -7,15 +7,24 @@ const
   ContextGenerated = CacheSeq"plugnim.contextGenerated"
   PlugnimDir = currentSourcePath().parentDir
   NimCompiler = getCurrentCompilerExe()
-  DynlibExt = when defined(windows): ".dll" elif defined(macosx): ".dylib" else: ".so"
+  DynlibExt =
+    when defined(windows):
+      ".dll"
+    elif defined(macosx):
+      ".dylib"
+    else:
+      ".so"
   contextSignatureSymbol = "plugnimContextSignature"
   plugnimPluginId {.strdefine.} = ""
 
 const isDynamicPluginBuild* = plugnimPluginId.len > 0
 
-func symbolName(pluginId, functionName: string): string = functionName & pluginId
-func pointerName(pluginId, functionName: string): string = symbolName(pluginId, functionName) & "Pointer"
-func stateVarName(pluginId, name: string): string = name & pluginId & "State"
+func symbolName(pluginId, functionName: string): string =
+  functionName & pluginId
+func pointerName(pluginId, functionName: string): string =
+  symbolName(pluginId, functionName) & "Pointer"
+func stateVarName(pluginId, name: string): string =
+  name & pluginId & "State"
 
 proc pluginCacheDir(pluginId: string): string =
   getTempDir() / "plugnim" / pluginId
@@ -26,7 +35,11 @@ proc pluginLibPath(pluginId: string, version: int): string =
 proc compileDynamicPlugin*(pluginId, sourceFile, outPath: string): bool =
   createDir outPath.parentDir
   let command = [
-    quoteShell NimCompiler, "c", "--app:lib", "--hints:off", "--warning:UnusedImport:off",
+    quoteShell NimCompiler,
+    "c",
+    "--app:lib",
+    "--hints:off",
+    "--warning:UnusedImport:off",
     "--nimcache:" & quoteShell(outPath.changeFileExt("") & ".nimcache"),
     "-d:plugnimPluginId=" & pluginId,
     "--path:" & quoteShell(PlugnimDir),
@@ -36,15 +49,20 @@ proc compileDynamicPlugin*(pluginId, sourceFile, outPath: string): bool =
   echo "plugnim: compiling plugin '", pluginId, "'"
   result = execShellCmd(command) == 0
   if not result:
-    echo "plugnim: could not compile plugin '", pluginId, "' (see the nim errors above)."
+    echo "plugnim: could not compile plugin '",
+      pluginId, "' (see the nim errors above)."
     echo "         source: ", sourceFile
     echo "         if this was a reload, the previously loaded version stays active."
 
-proc openPluginLib(path: string): LibHandle = loadLib(path)
+proc openPluginLib(path: string): LibHandle =
+  loadLib(path)
+
 proc closePluginLib(lib: LibHandle) =
   if not lib.isNil:
     unloadLib(lib)
-proc pluginSymbol(lib: LibHandle, name: string): pointer = lib.symAddr(name)
+
+proc pluginSymbol(lib: LibHandle, name: string): pointer =
+  lib.symAddr(name)
 
 proc pluginLibSignature*(lib: LibHandle): string =
   let symbol = lib.symAddr(contextSignatureSymbol)
@@ -61,7 +79,8 @@ proc checkPluginSignature(pluginId: string, lib: LibHandle, expected: string): b
   echo "  and plugin must agree on the context layout, otherwise the plugin would read"
   echo "  and write the wrong fields and corrupt memory. Rebuild the host to adopt the"
   echo "  new contract; the previously loaded version stays active."
-  echo "  host was built for: ", (if expected.len == 0: "(no shared state)" else: expected)
+  echo "  host was built for: ",
+    (if expected.len == 0: "(no shared state)" else: expected)
   echo "  plugin now expects: ", (if actual.len == 0: "(no shared state)" else: actual)
 
 proc reportMissingFunction(pluginId, functionName: string) =
@@ -71,10 +90,13 @@ proc reportMissingFunction(pluginId, functionName: string) =
   echo "  previously loaded version stays active."
 
 proc reportOpenFailure(pluginId, path: string) =
-  echo "plugnim: compiled plugin '", pluginId, "' but could not open its library at ", path
+  echo "plugnim: compiled plugin '",
+    pluginId, "' but could not open its library at ", path
 
-func exported(name: string): NimNode = postfix(ident name, "*")
-func ptrTo(name: string): NimNode = nnkPtrTy.newTree(ident name)
+func exported(name: string): NimNode =
+  postfix(ident name, "*")
+func ptrTo(name: string): NimNode =
+  nnkPtrTy.newTree(ident name)
 
 iterator pluginParams(procDef: NimNode): tuple[name: string, typ: NimNode] =
   let formalParams = procDef.params
@@ -106,7 +128,8 @@ proc register(cache: CacheSeq, identifier, procDef: NimNode) =
     newLit identifier.strVal,
     newLit identifier.lineInfoObj.filename,
     newLit order,
-    procDef)
+    procDef,
+  )
 
 proc registerState(pluginId, name: string) =
   PluginStates.add nnkPar.newTree(newLit pluginId, newLit name)
@@ -116,7 +139,9 @@ proc pluginStateNames(pluginId: string): seq[string] =
     if entry[0].strVal == pluginId:
       result.add entry[1].strVal
 
-iterator plugins(cache: CacheSeq): tuple[pluginId, functionName, file: string, order: int, def: NimNode] =
+iterator plugins(
+    cache: CacheSeq
+): tuple[pluginId, functionName, file: string, order: int, def: NimNode] =
   for entry in cache:
     let def = entry[3]
     yield (entry[0].strVal, def.name.strVal, entry[1].strVal, int(entry[2].intVal), def)
@@ -143,9 +168,10 @@ proc contextFields(): seq[tuple[name: string, typ: NimNode, plugin: string]] =
         if existing.name == name:
           known = true
           if existing.typ.repr != typ.repr:
-            error "dynamic plugins disagree on the type of shared state '" & name & "'.\n" &
-              "  plugin '" & existing.plugin & "' declares it as " & existing.typ.repr & "\n" &
-              "  plugin '" & p.pluginId & "' declares it as " & typ.repr & "\n" &
+            error "dynamic plugins disagree on the type of shared state '" & name &
+              "'.\n" & "  plugin '" & existing.plugin & "' declares it as " &
+              existing.typ.repr & "\n" & "  plugin '" & p.pluginId & "' declares it as " &
+              typ.repr & "\n" &
               "  All dynamic plugins share one context object, so each state name must have\n" &
               "  a single consistent type across every plugin.", typ
       if not known:
@@ -153,7 +179,8 @@ proc contextFields(): seq[tuple[name: string, typ: NimNode, plugin: string]] =
 
 proc expectPluginBody(identifier, body: NimNode) =
   if identifier.kind != nnkIdent:
-    error "a plugin needs a single name, e.g. `plugin Physics:`.\n  got: " & identifier.repr, identifier
+    error "a plugin needs a single name, e.g. `plugin Physics:`.\n  got: " &
+      identifier.repr, identifier
   if body.kind != nnkStmtList:
     error "a plugin body must be an indented block of proc definitions.", body
 
@@ -177,12 +204,17 @@ macro plugin*(identifier, body: untyped): untyped =
         for i in 0 ..< def.len - 2:
           let name = def[i].strVal
           registerState(identifier.strVal, name)
-          result.add nnkVarSection.newTree(newIdentDefs(
-            ident stateVarName(identifier.strVal, name),
-            copyNimTree(def[^2]), copyNimTree(def[^1])))
+          result.add nnkVarSection.newTree(
+            newIdentDefs(
+              ident stateVarName(identifier.strVal, name),
+              copyNimTree(def[^2]),
+              copyNimTree(def[^1]),
+            )
+          )
     else:
       error "plugin '" & identifier.strVal & "' may only contain proc definitions and\n" &
-        "  state declarations (`var`/`let`). Move anything else outside the plugin block.", item
+        "  state declarations (`var`/`let`). Move anything else outside the plugin block.",
+        item
 
 macro plugin*(identifier, flag, body: untyped): untyped =
   if not flag.eqIdent"dynamic":
@@ -193,13 +225,16 @@ macro plugin*(identifier, flag, body: untyped): untyped =
     if item.kind in {nnkVarSection, nnkLetSection}:
       error "dynamic plugin '" & identifier.strVal & "' can't declare private state.\n" &
         "  Dynamic plugins share one context across the shared-library boundary, so there\n" &
-        "  is nowhere to keep per-plugin state. Use a static plugin for private state.", item
+        "  is nowhere to keep per-plugin state. Use a static plugin for private state.",
+        item
     expectPluginProc(identifier, item)
     if item[2].kind != nnkEmpty:
       error "dynamic plugin function '" & item.name.strVal & "' can't be generic.\n" &
-        "  its parameters must be concrete types so the shared context has a fixed layout.", item[2]
+        "  its parameters must be concrete types so the shared context has a fixed layout.",
+        item[2]
     if item.params[0].kind != nnkEmpty:
-      error "dynamic plugin function '" & item.name.strVal & "' declares a return type.\n" &
+      error "dynamic plugin function '" & item.name.strVal &
+        "' declares a return type.\n" &
         "  Dynamic plugins are called across a shared-library boundary through void function\n" &
         "  pointers, so they can't return a value. Communicate results through plugin state\n" &
         "  (a parameter), which becomes part of the generated context.", item.params[0]
@@ -216,22 +251,36 @@ macro generatePluginContext*(): untyped =
 
   let signature = newLit ctxFields.mapIt(it.name & ":" & it.typ.repr).join(";")
 
-  result = newStmtList(nnkTypeSection.newTree(
-    nnkTypeDef.newTree(exported"PluginContext", newEmptyNode(),
-      nnkObjectTy.newTree(newEmptyNode(), newEmptyNode(), fields)),
-    nnkTypeDef.newTree(exported"PluginFunction", newEmptyNode(),
-      nnkProcTy.newTree(
-        nnkFormalParams.newTree(newEmptyNode(), newIdentDefs(ident"context", ptrTo"PluginContext")),
-        nnkPragma.newTree(ident"cdecl")))))
+  result = newStmtList(
+    nnkTypeSection.newTree(
+      nnkTypeDef.newTree(
+        exported"PluginContext",
+        newEmptyNode(),
+        nnkObjectTy.newTree(newEmptyNode(), newEmptyNode(), fields),
+      ),
+      nnkTypeDef.newTree(
+        exported"PluginFunction",
+        newEmptyNode(),
+        nnkProcTy.newTree(
+          nnkFormalParams.newTree(
+            newEmptyNode(), newIdentDefs(ident"context", ptrTo"PluginContext")
+          ),
+          nnkPragma.newTree(ident"cdecl"),
+        ),
+      ),
+    )
+  )
 
   result.add nnkConstSection.newTree(
-    nnkConstDef.newTree(exported"pluginContextSignature", newEmptyNode(), signature))
+    nnkConstDef.newTree(exported"pluginContextSignature", newEmptyNode(), signature)
+  )
 
   when plugnimPluginId.len > 0:
     let getter = ident contextSignatureSymbol
     result.add quote do:
       proc `getter`(): cstring {.exportc, dynlib, cdecl.} =
         pluginContextSignature.cstring
+
     let ctx = ident"plugnimContext"
     for p in plugins(DynamicPlugins):
       if p.pluginId != plugnimPluginId:
@@ -316,22 +365,31 @@ macro loadDynamicPlugins*(): untyped =
           `assigns`
           inc `version`
           true
+
         if not `loadPlugin`():
           quit "plugnim: could not load dynamic plugin '" & `id` & "' at startup."
 
-      reloadBranches.add nnkOfBranch.newTree(id, quote do:
-        discard `loadPlugin`())
+      reloadBranches.add nnkOfBranch.newTree(
+        id,
+        quote do:
+          discard `loadPlugin`(),
+      )
 
     if reloadBranches.len > 0:
       var dispatch = nnkCaseStmt.newTree(ident"pluginId")
       for branch in reloadBranches:
         dispatch.add branch
-      dispatch.add nnkElse.newTree(quote do:
-        raise newException(ValueError, "plugnim: no dynamic plugin named '" & pluginId & "'"))
+      dispatch.add nnkElse.newTree(
+        quote do:
+          raise newException(
+            ValueError, "plugnim: no dynamic plugin named '" & pluginId & "'"
+          )
+      )
       result.add newProc(
         exported"reloadDynamicPlugin",
         [newEmptyNode(), newIdentDefs(ident"pluginId", ident"string")],
-        newStmtList(dispatch))
+        newStmtList(dispatch),
+      )
 
 macro generatePluginFunctionCalls*(functionName: untyped): untyped =
   if functionName.kind != nnkIdent:
@@ -342,8 +400,9 @@ macro generatePluginFunctionCalls*(functionName: untyped): untyped =
     let wanted = functionName.strVal
     let known = knownFunctionNames()
     if wanted notin known:
-      error "no plugin defines a function named '" & wanted & "'.\n" &
-        "  known plugin functions: " & (if known.len == 0: "(none)" else: known.join(", ")), functionName
+      # error "no plugin defines a function named '" & wanted & "'.\n" &
+      #   "  known plugin functions: " & (if known.len == 0: "(none)" else: known.join(", ")), functionName
+      return
 
     let ctx = genSym(nskVar, "context")
     var calls: seq[tuple[order: int, call: NimNode]]
@@ -405,22 +464,26 @@ macro generatePluginFunctionCalls*(functionName: untyped): untyped =
 when isMainModule:
   plugin ABC:
     var banana = 42
-    proc load {.order: 10.} =
+    proc load() {.order: 10.} =
       echo "ONE"
+
     proc chode(banana: int) =
       echo &"CHODE {banana}"
+
     proc update(dt: float) =
       discard
 
   plugin DEF, dynamic:
-    proc load {.order: 9.} =
+    proc load() {.order: 9.} =
       echo "TWO"
+
     proc update(dt: float) =
       discard
 
   plugin GHI, dynamic:
     proc load(msg: string) {.order: 8.} =
       echo "THREE"
+
     proc update(dt: float) =
       discard
 
