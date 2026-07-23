@@ -3,6 +3,7 @@ import std/[macros, macrocache, strformat, strutils, sequtils, algorithm, os, dy
 const
   StaticPlugins = CacheSeq"plugnim.static"
   DynamicPlugins = CacheSeq"plugnim.dynamic"
+  PluginStates = CacheSeq"plugnim.states"
   ContextGenerated = CacheSeq"plugnim.contextGenerated"
   PlugnimDir = currentSourcePath().parentDir
   NimCompiler = getCurrentCompilerExe()
@@ -14,6 +15,7 @@ const isDynamicPluginBuild* = plugnimPluginId.len > 0
 
 func symbolName(pluginId, functionName: string): string = functionName & pluginId
 func pointerName(pluginId, functionName: string): string = symbolName(pluginId, functionName) & "Pointer"
+func stateVarName(pluginId, name: string): string = name & pluginId & "State"
 
 proc pluginCacheDir(pluginId: string): string =
   getTempDir() / "plugnim" / pluginId
@@ -106,6 +108,14 @@ proc register(cache: CacheSeq, identifier, procDef: NimNode) =
     newLit order,
     procDef)
 
+proc registerState(pluginId, name: string) =
+  PluginStates.add nnkPar.newTree(newLit pluginId, newLit name)
+
+proc pluginStateNames(pluginId: string): seq[string] =
+  for entry in PluginStates:
+    if entry[0].strVal == pluginId:
+      result.add entry[1].strVal
+
 iterator plugins(cache: CacheSeq): tuple[pluginId, functionName, file: string, order: int, def: NimNode] =
   for entry in cache:
     let def = entry[3]
@@ -155,29 +165,45 @@ proc expectPluginProc(identifier, node: NimNode) =
 macro plugin*(identifier, body: untyped): untyped =
   expectPluginBody(identifier, body)
   result = newStmtList()
-  for procDef in body:
-    expectPluginProc(identifier, procDef)
-    register(StaticPlugins, identifier, procDef)
-    let emitted = copyNimTree(procDef)
-    emitted.name = ident symbolName(identifier.strVal, procDef.name.strVal)
-    result.add emitted
+  for item in body:
+    case item.kind
+    of nnkProcDef:
+      register(StaticPlugins, identifier, item)
+      let emitted = copyNimTree(item)
+      emitted.name = ident symbolName(identifier.strVal, item.name.strVal)
+      result.add emitted
+    of nnkVarSection, nnkLetSection:
+      for def in item:
+        for i in 0 ..< def.len - 2:
+          let name = def[i].strVal
+          registerState(identifier.strVal, name)
+          result.add nnkVarSection.newTree(newIdentDefs(
+            ident stateVarName(identifier.strVal, name),
+            copyNimTree(def[^2]), copyNimTree(def[^1])))
+    else:
+      error "plugin '" & identifier.strVal & "' may only contain proc definitions and\n" &
+        "  state declarations (`var`/`let`). Move anything else outside the plugin block.", item
 
 macro plugin*(identifier, flag, body: untyped): untyped =
   if not flag.eqIdent"dynamic":
     error "unknown plugin flag '" & flag.repr & "'.\n" &
       "  the only supported flag is `dynamic`, as in `plugin Physics, dynamic:`.", flag
   expectPluginBody(identifier, body)
-  for procDef in body:
-    expectPluginProc(identifier, procDef)
-    if procDef[2].kind != nnkEmpty:
-      error "dynamic plugin function '" & procDef.name.strVal & "' can't be generic.\n" &
-        "  its parameters must be concrete types so the shared context has a fixed layout.", procDef[2]
-    if procDef.params[0].kind != nnkEmpty:
-      error "dynamic plugin function '" & procDef.name.strVal & "' declares a return type.\n" &
+  for item in body:
+    if item.kind in {nnkVarSection, nnkLetSection}:
+      error "dynamic plugin '" & identifier.strVal & "' can't declare private state.\n" &
+        "  Dynamic plugins share one context across the shared-library boundary, so there\n" &
+        "  is nowhere to keep per-plugin state. Use a static plugin for private state.", item
+    expectPluginProc(identifier, item)
+    if item[2].kind != nnkEmpty:
+      error "dynamic plugin function '" & item.name.strVal & "' can't be generic.\n" &
+        "  its parameters must be concrete types so the shared context has a fixed layout.", item[2]
+    if item.params[0].kind != nnkEmpty:
+      error "dynamic plugin function '" & item.name.strVal & "' declares a return type.\n" &
         "  Dynamic plugins are called across a shared-library boundary through void function\n" &
         "  pointers, so they can't return a value. Communicate results through plugin state\n" &
-        "  (a parameter), which becomes part of the generated context.", procDef.params[0]
-    register(DynamicPlugins, identifier, procDef)
+        "  (a parameter), which becomes part of the generated context.", item.params[0]
+    register(DynamicPlugins, identifier, item)
   result = newStmtList()
 
 macro generatePluginContext*(): untyped =
@@ -327,10 +353,29 @@ macro generatePluginFunctionCalls*(functionName: untyped): untyped =
     for p in plugins(StaticPlugins):
       if p.functionName != wanted:
         continue
+      let states = pluginStateNames(p.pluginId)
       var call = newCall(ident symbolName(p.pluginId, p.functionName))
+      var used: seq[string]
       for (name, _) in pluginParams(p.def):
         call.add ident(name)
-      calls.add (p.order, call)
+        if name in states and name notin used:
+          used.add name
+      if used.len == 0:
+        calls.add (p.order, call)
+      else:
+        var body = newStmtList()
+        for name in used:
+          let local = ident name
+          let stateVar = ident stateVarName(p.pluginId, name)
+          body.add quote do:
+            var `local` = `stateVar`
+        body.add call
+        for name in used:
+          let local = ident name
+          let stateVar = ident stateVarName(p.pluginId, name)
+          body.add quote do:
+            `stateVar` = `local`
+        calls.add (p.order, nnkBlockStmt.newTree(newEmptyNode(), body))
 
     for p in plugins(DynamicPlugins):
       if p.functionName != wanted:
@@ -359,10 +404,11 @@ macro generatePluginFunctionCalls*(functionName: untyped): untyped =
 
 when isMainModule:
   plugin ABC:
+    var banana = 42
     proc load {.order: 10.} =
       echo "ONE"
-    proc chode =
-      echo "CHODE"
+    proc chode(banana: int) =
+      echo &"CHODE {banana}"
     proc update(dt: float) =
       discard
 

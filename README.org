@@ -1,0 +1,66 @@
+#+TITLE: Plugnim
+
+A plugin system and code organization library. Organize your runtime into plugins. Static dispatch for static plugins, hotloading of dynamic plugins.
+
+** How to define a plugin
+
+#+begin_src  nim
+
+plugin EntityCollisionDetection:
+  # Define private state for the plugin
+  var collisions = newSeq[(a, b: EntityId)]()
+  var debugEnabled = false
+
+  # Define the steps for your plugin, this will run during the 'load' step
+  proc load =
+    echo "[Loaded collision detector]"
+
+  # update needs 'entities' and 'collisions', entities is defined in the application, but collisions is defined
+  # by this plugin, each plugin can define state that is private to the plugin.
+  proc update(entities: EntityManager, collisions: var seq[(a, b: EntityId)]) =
+    for entity in entities:
+      for other in entities:
+        if other.id == entity.id:
+          continue
+        if entity.collides(other):
+          # because we pulled in collisions using 'var', we can append to it
+          collisions.add((entity.id, other.id))
+          
+  proc draw(debugEnabled: bool, collisions: seq[(a, b: EntityId)]) =
+    if not debugEnabled:
+      return
+    # ...
+
+# Adding dynamic will make this plugin built in its own compilation unit, a dynamic library
+# for the host system will be produced, it will be loaded at runtime
+plugin MyDynamicPlugin, dynamic:
+  # dt is defined at the call site of the 'draw' step, so we can pull it in as
+  # an argument to draw, order: -1 means that this draw runs before all others,
+  # the default order is 0
+  proc draw(dt: float) {.order: -1.} =
+    setBackgroundColor(colorFromTime(dt))
+
+# ...
+proc start() =
+  # ...
+  generatePluginContext()
+  generatePluginFunctionCalls(load)
+  
+  var entities: EntityManager = EntityManager.init()
+  while running:
+    let dt = getDeltaTime()
+    generatePluginFunctionCalls(update)
+    generatePluginFunctionCalls(draw)
+    if isKeyPressed r:
+      echo "RELOADING"
+      reloadDynamicPlugin("MyDynamicPlugin")
+
+
+#+end_src
+
+** Why Plugnim?
+
+Why Plugnim? In desktop applications and realtime software like video games, its useful having an interface for hooking into the different stages of the runtime. Many frameworks give you a class that you can extend, overriding the methods needed for the plugin. You may want your plugin to run during the draw and update phase, sometimes you don't need drawing. As an example of a plugin, lets take monogame as an example, it gives you the =DrawableGameComponent=. You must register your custom component (what I call a plugin) with the runtime, because the class defines the prototype of the method, you as a implementer of the =DrawableGameComponent= class, are only allowed to give it state through its constructor, or custom methods. If you don't need access to the =GameTime= during the =Draw= stage, it doens't matter , the method defines that all children that implement Draw, must take in a =GameTime=. Each component in monogame, is an instantiated runtime object, depending on C#'s runtime it may be heap allocated. Every plugin within your application needs differen't resources, different views into the application state, some may need mutable references, some only need to read the data. Some plugins need to hook into initialization and draw, but not update. Plugins shouldn't require state unless needed, no plugins should require allocation and manual registration. We can do much better using compile time meta programming. Plugnim is an attempt at creating the best of all worlds, an opt into complexity as needed plugin system.
+
+* References
+https://docs.monogame.net/api/Microsoft.Xna.Framework.DrawableGameComponent.html
