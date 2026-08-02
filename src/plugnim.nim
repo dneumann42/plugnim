@@ -357,11 +357,15 @@ proc expectPluginProc(identifier, node: NimNode) =
 macro plugin*(identifier, body: untyped): untyped =
   expectPluginBody(identifier, body)
   result = newStmtList()
+  let controlsType = bindSym"PluginControls"
+  result.add quote do:
+    when not declared(plugnimPluginControls):
+      var plugnimPluginControls {.inject.}: `controlsType`
   for item in body:
     case item.kind
     of nnkProcDef:
       register(StaticPlugins, identifier, item)
-      var emitted = nnkTemplateDef.newTree()
+      var emitted = nnkProcDef.newTree()
       for child in item:
         emitted.add copyNimTree(child)
       emitted.name = ident symbolName(identifier.strVal, item.name.strVal)
@@ -920,7 +924,9 @@ macro loadDynamicPlugins*(): untyped =
       proc plugnimLastErrorCallback(): cstring {.cdecl.} =
         plugnimLastError.cstring
 
-      let plugnimPluginControls {.inject.} = PluginControls(
+      when not declared(plugnimPluginControls):
+        var plugnimPluginControls {.inject.}: PluginControls
+      plugnimPluginControls = PluginControls(
         listPlugins: plugnimListPluginsCallback,
         reloadPlugin: plugnimReloadPluginCallback,
         requestFrame: plugnimRequestFrameCallback,
@@ -1042,31 +1048,33 @@ macro generatePluginFunctionCalls*(functionName: untyped): untyped =
 
     for entry in calls.sortedByIt(it.order):
       result.add entry.call
+
 when isMainModule:
-  plugin ABC:
-    var banana = 42
-    proc load() {.order: 10.} =
-      echo "ONE"
+  expandMacros:
+    plugin ABC:
+      var banana = 42
+      proc load() {.order: 10.} =
+        echo "ONE"
+    
+      proc chode(banana: int) =
+        echo &"CHODE {banana}"
+    
+      proc update(dt: float) =
+        discard
 
-    proc chode(banana: int) =
-      echo &"CHODE {banana}"
-
-    proc update(dt: float) =
-      discard
-
-  plugin DEF, dynamic:
+  plugin DEF:
     proc load() {.order: 9.} =
       echo "TWO"
 
     proc update(dt: float) =
       discard
 
-  plugin GHI, dynamic:
+  plugin GHI:
     proc load(msg: string) {.order: 8.} =
       echo "THREE"
 
     proc update(dt: float) =
-      discard
+      echo "123"
 
   generatePluginContext()
 
@@ -1075,8 +1083,8 @@ when isMainModule:
 
     let dt = 0.0016
     let msg = "Banana"
-    generatePluginFunctionCalls(update)
-    generatePluginFunctionCalls(load)
-    generatePluginFunctionCalls(chode)
-    reloadDynamicPlugin("GHI")
-    generatePluginFunctionCalls(load)
+    var banana: int = 0
+
+    expandMacros:
+      generatePluginFunctionCalls(update)
+
