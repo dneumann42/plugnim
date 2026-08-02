@@ -1,8 +1,12 @@
-import std/[macros, macrocache, strformat, strutils, sequtils, algorithm, os, dynlib]
+import std/[
+  macros, macrocache, strformat, strutils, sequtils, algorithm, os, dynlib, osproc,
+  streams, times,
+]
 
 const
   StaticPlugins = CacheSeq"plugnim.static"
   DynamicPlugins = CacheSeq"plugnim.dynamic"
+  WatchedDynamicPlugins = CacheSeq"plugnim.dynamic.watched"
   PluginStates = CacheSeq"plugnim.states"
   ContextGenerated = CacheSeq"plugnim.contextGenerated"
   PlugnimDir = currentSourcePath().parentDir
@@ -16,8 +20,72 @@ const
       ".so"
   contextSignatureSymbol = "plugnimContextSignature"
   plugnimPluginId {.strdefine.} = ""
+  pluginControlsField = "pluginControls"
+  pluginWatchDebounceSeconds = 0.25
 
 const isDynamicPluginBuild* = plugnimPluginId.len > 0
+
+type PluginControls* = object
+  listPlugins*: proc(): cstring {.cdecl.}
+  reloadPlugin*: proc(pluginId: cstring): bool {.cdecl.}
+  requestFrame*: proc() {.cdecl.}
+  setWidgetText*: proc(id: uint64, text: cstring) {.cdecl.}
+  buildStatus*: proc(): cstring {.cdecl.}
+  lastOutput*: proc(): cstring {.cdecl.}
+  lastError*: proc(): cstring {.cdecl.}
+
+var
+  plugnimLastOutput* = ""
+  plugnimLastError* = ""
+  plugnimBuildStatus* = "idle"
+  plugnimRuntimeFrameRequested* = false
+  plugnimSetWidgetTextCallback*:
+    proc(id: uint64, text: cstring) {.cdecl.}
+
+proc plugins*(controls: PluginControls): seq[string] =
+  if controls.listPlugins.isNil:
+    return
+  let text = $controls.listPlugins()
+  if text.len == 0:
+    @[]
+  else:
+    text.splitLines()
+
+proc reload*(controls: PluginControls, pluginId: string): bool {.discardable.} =
+  if controls.reloadPlugin.isNil:
+    false
+  else:
+    controls.reloadPlugin(pluginId.cstring)
+
+proc requestFrame*(controls: PluginControls) =
+  if not controls.requestFrame.isNil:
+    controls.requestFrame()
+
+proc setWidgetTextValue*(controls: PluginControls, id: uint64, text: string) =
+  if not controls.setWidgetText.isNil:
+    controls.setWidgetText(id, text.cstring)
+
+proc consumeRuntimeFrameRequest*(): bool =
+  result = plugnimRuntimeFrameRequested
+  plugnimRuntimeFrameRequested = false
+
+proc lastOutput*(controls: PluginControls): string =
+  if controls.lastOutput.isNil:
+    ""
+  else:
+    $controls.lastOutput()
+
+proc buildStatus*(controls: PluginControls): string =
+  if controls.buildStatus.isNil:
+    ""
+  else:
+    $controls.buildStatus()
+
+proc lastError*(controls: PluginControls): string =
+  if controls.lastError.isNil:
+    ""
+  else:
+    $controls.lastError()
 
 func symbolName(pluginId, functionName: string): string =
   functionName & pluginId
@@ -32,27 +100,59 @@ proc pluginCacheDir(pluginId: string): string =
 proc pluginLibPath(pluginId: string, version: int): string =
   pluginCacheDir(pluginId) / ("plugin." & $version & DynlibExt)
 
-proc compileDynamicPlugin*(pluginId, sourceFile, outPath: string): bool =
-  createDir outPath.parentDir
-  let command = [
-    quoteShell NimCompiler,
+proc dynamicPluginCompileArgs*(pluginId, sourceFile, outPath: string): seq[string] =
+  @[
     "c",
     "--app:lib",
     "--hints:off",
     "--warning:UnusedImport:off",
-    "--nimcache:" & quoteShell(outPath.changeFileExt("") & ".nimcache"),
+    "--nimcache:" & outPath.changeFileExt("") & ".nimcache",
     "-d:plugnimPluginId=" & pluginId,
-    "--path:" & quoteShell(PlugnimDir),
-    "--out:" & quoteShell(outPath),
-    quoteShell sourceFile,
-  ].join(" ")
+    "--path:" & PlugnimDir,
+    "--out:" & outPath,
+    sourceFile,
+  ]
+
+proc compileDynamicPlugin*(pluginId, sourceFile, outPath: string): bool =
+  createDir outPath.parentDir
+  var command = @[quoteShell NimCompiler]
+  for arg in dynamicPluginCompileArgs(pluginId, sourceFile, outPath):
+    command.add quoteShell(arg)
   echo "plugnim: compiling plugin '", pluginId, "'"
-  result = execShellCmd(command) == 0
+  let (output, exitCode) = execCmdEx(command.join(" "))
+  plugnimLastOutput = output
+  if output.len > 0:
+    stdout.write output
+  result = exitCode == 0
+  plugnimLastError =
+    if result:
+      ""
+    else:
+      output
   if not result:
     echo "plugnim: could not compile plugin '",
       pluginId, "' (see the nim errors above)."
     echo "         source: ", sourceFile
     echo "         if this was a reload, the previously loaded version stays active."
+
+proc startDynamicPluginCompile*(
+    pluginId, sourceFile, outPath: string
+): Process {.raises: [OSError, IOError].} =
+  createDir outPath.parentDir
+  echo "plugnim: compiling plugin '", pluginId, "'"
+  startProcess(
+    NimCompiler,
+    args = dynamicPluginCompileArgs(pluginId, sourceFile, outPath),
+    options = {poStdErrToStdOut},
+  )
+
+proc finishDynamicPluginCompile*(process: Process): tuple[output: string, exitCode: int] =
+  result.exitCode = process.peekExitCode()
+  result.output = process.outputStream().readAll()
+  process.close()
+
+proc dynamicPluginCompileRunning*(process: Process): bool =
+  process.running
 
 proc openPluginLib(path: string): LibHandle =
   loadLib(path)
@@ -74,6 +174,9 @@ proc checkPluginSignature(pluginId: string, lib: LibHandle, expected: string): b
   let actual = pluginLibSignature(lib)
   if actual == expected:
     return true
+  plugnimLastError = "plugin '" & pluginId & "' context signature mismatch: host " &
+    (if expected.len == 0: "(no shared state)" else: expected) &
+    ", plugin " & (if actual.len == 0: "(no shared state)" else: actual)
   echo "plugnim: refusing to activate plugin '", pluginId, "'."
   echo "  Its shared-state contract changed since the host program was built. The host"
   echo "  and plugin must agree on the context layout, otherwise the plugin would read"
@@ -84,12 +187,15 @@ proc checkPluginSignature(pluginId: string, lib: LibHandle, expected: string): b
   echo "  plugin now expects: ", (if actual.len == 0: "(no shared state)" else: actual)
 
 proc reportMissingFunction(pluginId, functionName: string) =
+  plugnimLastError =
+    "plugin '" & pluginId & "' no longer provides '" & functionName & "'"
   echo "plugnim: refusing to activate plugin '", pluginId, "'."
   echo "  It no longer provides '", functionName, "', which the host program calls. A"
   echo "  reloaded plugin must keep every function the host was built against. The"
   echo "  previously loaded version stays active."
 
 proc reportOpenFailure(pluginId, path: string) =
+  plugnimLastError = "plugin '" & pluginId & "' compiled but could not open " & path
   echo "plugnim: compiled plugin '",
     pluginId, "' but could not open its library at ", path
 
@@ -97,6 +203,17 @@ func exported(name: string): NimNode =
   postfix(ident name, "*")
 func ptrTo(name: string): NimNode =
   nnkPtrTy.newTree(ident name)
+func ptrTo(typ: NimNode): NimNode =
+  nnkPtrTy.newTree(copyNimTree(typ))
+
+func contextFieldType(typ: NimNode): NimNode =
+  if typ.kind == nnkVarTy:
+    copyNimTree(typ[0])
+  else:
+    copyNimTree(typ)
+
+func contextPtrTo(typ: NimNode): NimNode =
+  nnkPtrTy.newTree(contextFieldType(typ))
 
 iterator pluginParams(procDef: NimNode): tuple[name: string, typ: NimNode] =
   let formalParams = procDef.params
@@ -134,6 +251,20 @@ proc register(cache: CacheSeq, identifier, procDef: NimNode) =
 proc registerState(pluginId, name: string) =
   PluginStates.add nnkPar.newTree(newLit pluginId, newLit name)
 
+proc registerWatchedDynamicPlugin(identifier: NimNode) =
+  for entry in WatchedDynamicPlugins:
+    if entry[0].strVal == identifier.strVal:
+      return
+  WatchedDynamicPlugins.add nnkPar.newTree(
+    newLit identifier.strVal,
+    newLit identifier.lineInfoObj.filename,
+  )
+
+proc isWatchedDynamicPlugin(pluginId: string): bool =
+  for entry in WatchedDynamicPlugins:
+    if entry[0].strVal == pluginId:
+      return true
+
 proc pluginStateNames(pluginId: string): seq[string] =
   for entry in PluginStates:
     if entry[0].strVal == pluginId:
@@ -153,6 +284,38 @@ iterator dynamicPluginFiles(): tuple[pluginId, file: string] =
       seen.add p.pluginId
       yield (p.pluginId, p.file)
 
+proc expectPluginBody(identifier, body: NimNode)
+proc expectPluginProc(identifier, node: NimNode)
+
+proc validateDynamicPlugin(identifier, body: NimNode) =
+  expectPluginBody(identifier, body)
+  for item in body:
+    if item.kind in {nnkVarSection, nnkLetSection}:
+      error "dynamic plugin '" & identifier.strVal & "' can't declare private state.\n" &
+        "  Dynamic plugins share one context across the shared-library boundary, so there\n" &
+        "  is nowhere to keep per-plugin state. Use a static plugin for private state.",
+        item
+    expectPluginProc(identifier, item)
+    if item[2].kind != nnkEmpty:
+      error "dynamic plugin function '" & item.name.strVal & "' can't be generic.\n" &
+        "  its parameters must be concrete types so the shared context has a fixed layout.",
+        item[2]
+    if item.params[0].kind != nnkEmpty:
+      error "dynamic plugin function '" & item.name.strVal &
+        "' declares a return type.\n" &
+        "  Dynamic plugins are called across a shared-library boundary through void function\n" &
+        "  pointers, so they can't return a value. Communicate results through plugin state\n" &
+        "  (a parameter), which becomes part of the generated context.", item.params[0]
+
+proc registerDynamicPlugin(identifier, body: NimNode) =
+  for item in body:
+    register(DynamicPlugins, identifier, item)
+
+proc watchedDynamicPluginEntries(): seq[tuple[pluginId, file: string]] =
+  for (pluginId, file) in dynamicPluginFiles():
+    if pluginId.isWatchedDynamicPlugin:
+      result.add (pluginId, file)
+
 proc knownFunctionNames(): seq[string] =
   for p in plugins(StaticPlugins):
     result.add p.functionName
@@ -163,6 +326,8 @@ proc knownFunctionNames(): seq[string] =
 proc contextFields(): seq[tuple[name: string, typ: NimNode, plugin: string]] =
   for p in plugins(DynamicPlugins):
     for (name, typ) in pluginParams(p.def):
+      if name == pluginControlsField:
+        continue
       var known = false
       for existing in result:
         if existing.name == name:
@@ -196,8 +361,24 @@ macro plugin*(identifier, body: untyped): untyped =
     case item.kind
     of nnkProcDef:
       register(StaticPlugins, identifier, item)
-      let emitted = copyNimTree(item)
+      var emitted = nnkTemplateDef.newTree()
+      for child in item:
+        emitted.add copyNimTree(child)
       emitted.name = ident symbolName(identifier.strVal, item.name.strVal)
+      var hasControlsParam = false
+      for (name, _) in pluginParams(item):
+        if name == pluginControlsField:
+          hasControlsParam = true
+          break
+      if not hasControlsParam:
+        let originalBody = emitted.body
+        emitted.body = newStmtList(
+          quote do:
+            template pluginControls: untyped =
+              plugnimPluginControls
+          ,
+          originalBody,
+        )
       result.add emitted
     of nnkVarSection, nnkLetSection:
       for def in item:
@@ -220,34 +401,100 @@ macro plugin*(identifier, flag, body: untyped): untyped =
   if not flag.eqIdent"dynamic":
     error "unknown plugin flag '" & flag.repr & "'.\n" &
       "  the only supported flag is `dynamic`, as in `plugin Physics, dynamic:`.", flag
-  expectPluginBody(identifier, body)
-  for item in body:
-    if item.kind in {nnkVarSection, nnkLetSection}:
-      error "dynamic plugin '" & identifier.strVal & "' can't declare private state.\n" &
-        "  Dynamic plugins share one context across the shared-library boundary, so there\n" &
-        "  is nowhere to keep per-plugin state. Use a static plugin for private state.",
-        item
-    expectPluginProc(identifier, item)
-    if item[2].kind != nnkEmpty:
-      error "dynamic plugin function '" & item.name.strVal & "' can't be generic.\n" &
-        "  its parameters must be concrete types so the shared context has a fixed layout.",
-        item[2]
-    if item.params[0].kind != nnkEmpty:
-      error "dynamic plugin function '" & item.name.strVal &
-        "' declares a return type.\n" &
-        "  Dynamic plugins are called across a shared-library boundary through void function\n" &
-        "  pointers, so they can't return a value. Communicate results through plugin state\n" &
-        "  (a parameter), which becomes part of the generated context.", item.params[0]
-    register(DynamicPlugins, identifier, item)
+  validateDynamicPlugin(identifier, body)
   result = newStmtList()
+  registerDynamicPlugin(identifier, body)
+
+  when plugnimPluginId.len > 0:
+    if plugnimPluginId == identifier.strVal:
+      let ctxFields = contextFields()
+
+      var fields = nnkRecList.newTree()
+      fields.add newIdentDefs(exported pluginControlsField, ident"PluginControls")
+      for field in ctxFields:
+        fields.add newIdentDefs(exported field.name, contextPtrTo(field.typ))
+
+      let signature = newLit ctxFields.mapIt(it.name & ":" & it.typ.repr).join(";")
+      result.add nnkTypeSection.newTree(
+        nnkTypeDef.newTree(
+          exported"PluginContext",
+          newEmptyNode(),
+          nnkObjectTy.newTree(newEmptyNode(), newEmptyNode(), fields),
+        ),
+        nnkTypeDef.newTree(
+          exported"PluginFunction",
+          newEmptyNode(),
+          nnkProcTy.newTree(
+            nnkFormalParams.newTree(
+              newEmptyNode(), newIdentDefs(ident"context", ptrTo"PluginContext")
+            ),
+            nnkPragma.newTree(ident"cdecl"),
+          ),
+        ),
+      )
+      result.add nnkConstSection.newTree(
+        nnkConstDef.newTree(exported"pluginContextSignature", newEmptyNode(), signature)
+      )
+
+      let getter = ident contextSignatureSymbol
+      result.add quote do:
+        proc `getter`(): cstring {.exportc, dynlib, cdecl.} =
+          pluginContextSignature.cstring
+
+      let ctx = ident"plugnimContext"
+      let controlsField = ident pluginControlsField
+      for item in body:
+        var procBody = newStmtList()
+        var hasControlsParam = false
+        for (name, _) in pluginParams(item):
+          if name == pluginControlsField:
+            hasControlsParam = true
+            break
+        if hasControlsParam:
+          procBody.add quote do:
+            template reloadDynamicPlugin(pluginId: string) =
+              discard `ctx`.`controlsField`.reload(pluginId)
+        else:
+          procBody.add quote do:
+            template pluginControls: untyped =
+              `ctx`.`controlsField`
+            template reloadDynamicPlugin(pluginId: string) =
+              discard pluginControls.reload(pluginId)
+        for (name, _) in pluginParams(item):
+          let local = ident name
+          if name == pluginControlsField:
+            procBody.add quote do:
+              template `local`: untyped =
+                `ctx`.`controlsField`
+          else:
+            procBody.add quote do:
+              template `local`: untyped =
+                `ctx`.`local`[]
+        procBody.add copyNimTree(item.body)
+        let sym = ident symbolName(identifier.strVal, item.name.strVal)
+        result.add quote do:
+          proc `sym`(`ctx`: ptr PluginContext) {.exportc, dynlib, cdecl.} =
+            `procBody`
+
+macro plugin*(identifier, flag, watchFlag, body: untyped): untyped =
+  if not flag.eqIdent"dynamic":
+    error "unknown plugin flag '" & flag.repr & "'.\n" &
+      "  expected `dynamic`, as in `plugin Physics, dynamic, watch:`.", flag
+  if not watchFlag.eqIdent"watch":
+    error "unknown dynamic plugin flag '" & watchFlag.repr & "'.\n" &
+      "  expected `watch`, as in `plugin Physics, dynamic, watch:`.", watchFlag
+  validateDynamicPlugin(identifier, body)
+  registerWatchedDynamicPlugin(identifier)
+  result = newCall(bindSym"plugin", identifier, flag, body)
 
 macro generatePluginContext*(): untyped =
   ContextGenerated.add newLit(true)
   let ctxFields = contextFields()
 
   var fields = nnkRecList.newTree()
+  fields.add newIdentDefs(exported pluginControlsField, ident"PluginControls")
   for field in ctxFields:
-    fields.add newIdentDefs(exported field.name, copyNimTree(field.typ))
+    fields.add newIdentDefs(exported field.name, contextPtrTo(field.typ))
 
   let signature = newLit ctxFields.mapIt(it.name & ":" & it.typ.repr).join(";")
 
@@ -275,21 +522,58 @@ macro generatePluginContext*(): untyped =
     nnkConstDef.newTree(exported"pluginContextSignature", newEmptyNode(), signature)
   )
 
-  when plugnimPluginId.len > 0:
+  when plugnimPluginId.len == 0:
+    if DynamicPlugins.len > 0:
+      result.add quote do:
+        proc plugnimNoopPluginFunction(context: ptr PluginContext) {.cdecl.} =
+          discard
+
+      var declaredPointers: seq[string]
+      for p in plugins(DynamicPlugins):
+        let fnPointerName = pointerName(p.pluginId, p.functionName)
+        if fnPointerName in declaredPointers:
+          continue
+        declaredPointers.add fnPointerName
+        let fnPointer = ident fnPointerName
+        result.add quote do:
+          var `fnPointer`: PluginFunction = plugnimNoopPluginFunction
+  else:
     let getter = ident contextSignatureSymbol
     result.add quote do:
       proc `getter`(): cstring {.exportc, dynlib, cdecl.} =
         pluginContextSignature.cstring
 
     let ctx = ident"plugnimContext"
+    let controlsField = ident pluginControlsField
     for p in plugins(DynamicPlugins):
       if p.pluginId != plugnimPluginId:
         continue
       var body = newStmtList()
+      var hasControlsParam = false
+      for (name, _) in pluginParams(p.def):
+        if name == pluginControlsField:
+          hasControlsParam = true
+          break
+      if hasControlsParam:
+        body.add quote do:
+          template reloadDynamicPlugin(pluginId: string) =
+            discard `ctx`.`controlsField`.reload(pluginId)
+      else:
+        body.add quote do:
+          template pluginControls: untyped =
+            `ctx`.`controlsField`
+          template reloadDynamicPlugin(pluginId: string) =
+            discard pluginControls.reload(pluginId)
       for (name, _) in pluginParams(p.def):
         let local = ident name
-        body.add quote do:
-          let `local` = `ctx`.`local`
+        if name == pluginControlsField:
+          body.add quote do:
+            template `local`: untyped =
+              `ctx`.`controlsField`
+        else:
+          body.add quote do:
+            template `local`: untyped =
+              `ctx`.`local`[]
       body.add copyNimTree(p.def.body)
       let sym = ident symbolName(p.pluginId, p.functionName)
       result.add quote do:
@@ -306,6 +590,9 @@ macro loadDynamicPlugins*(): untyped =
 
     let
       compile = bindSym"compileDynamicPlugin"
+      startCompile = bindSym"startDynamicPluginCompile"
+      finishCompile = bindSym"finishDynamicPluginCompile"
+      compileRunning = bindSym"dynamicPluginCompileRunning"
       libPath = bindSym"pluginLibPath"
       openLib = bindSym"openPluginLib"
       closeLib = bindSym"closePluginLib"
@@ -315,13 +602,31 @@ macro loadDynamicPlugins*(): untyped =
       reportOpen = bindSym"reportOpenFailure"
 
     var reloadBranches: seq[NimNode]
+    var startBuildBranches: seq[NimNode]
+    var pollBuildCalls: seq[NimNode]
+    var activeBuildChecks: seq[NimNode]
+    var readyBuildChecks: seq[NimNode]
+    var activateReadyCalls: seq[NimNode]
+    var pluginIds: seq[string]
     for (pluginId, file) in dynamicPluginFiles():
+      pluginIds.add pluginId
       let
         lib = genSym(nskVar, "lib")
         version = genSym(nskVar, "version")
+        buildProcess = genSym(nskVar, "buildProcess")
+        buildPath = genSym(nskVar, "buildPath")
+        buildActive = genSym(nskVar, "buildActive")
+        readyPath = genSym(nskVar, "readyPath")
+        activatePlugin = genSym(nskProc, "activatePlugin")
         loadPlugin = genSym(nskProc, "loadPlugin")
+        startPluginBuild = genSym(nskProc, "startPluginBuild")
+        pollPluginBuild = genSym(nskProc, "pollPluginBuild")
+        hasActiveBuild = genSym(nskProc, "hasActiveBuild")
+        hasReadyBuild = genSym(nskProc, "hasReadyBuild")
+        activateReadyPlugin = genSym(nskProc, "activateReadyPlugin")
         candidate = genSym(nskLet, "candidate")
         path = genSym(nskLet, "path")
+        pathParam = genSym(nskParam, "path")
         id = newLit pluginId
         src = newLit file
 
@@ -334,8 +639,6 @@ macro loadDynamicPlugins*(): untyped =
         let sym = newLit symbolName(p.pluginId, p.functionName)
         let fnName = newLit p.functionName
         let resolved = genSym(nskLet, "fn")
-        result.add quote do:
-          var `fnPointer`: PluginFunction
         resolves.add quote do:
           let `resolved` = `pluginSym`(`candidate`, `sym`)
           if `resolved`.isNil:
@@ -348,23 +651,87 @@ macro loadDynamicPlugins*(): untyped =
       result.add quote do:
         var `lib`: LibHandle
         var `version` = 0
-        proc `loadPlugin`(): bool =
-          let `path` = `libPath`(`id`, `version`)
-          if not `compile`(`id`, `src`, `path`):
-            return false
-          let `candidate` = `openLib`(`path`)
+        var `buildProcess`: Process
+        var `buildPath` = ""
+        var `buildActive` = false
+        var `readyPath` = ""
+
+        proc `activatePlugin`(`pathParam`: string): bool =
+          let `candidate` = `openLib`(`pathParam`)
           if `candidate`.isNil:
-            `reportOpen`(`id`, `path`)
+            `reportOpen`(`id`, `pathParam`)
             return false
           if not `checkSig`(`id`, `candidate`, pluginContextSignature):
             `closeLib`(`candidate`)
             return false
           `resolves`
-          `closeLib`(`lib`)
           `lib` = `candidate`
           `assigns`
           inc `version`
           true
+
+        proc `loadPlugin`(): bool =
+          let `path` = `libPath`(`id`, `version`)
+          if not `compile`(`id`, `src`, `path`):
+            return false
+          `activatePlugin`(`path`)
+
+        proc `startPluginBuild`(): bool =
+          if `buildActive`:
+            return false
+          `buildPath` = `libPath`(`id`, `version`)
+          try:
+            `buildProcess` = `startCompile`(`id`, `src`, `buildPath`)
+            `buildActive` = true
+            plugnimBuildStatus = "building"
+            plugnimLastOutput = ""
+            plugnimLastError = ""
+            true
+          except CatchableError as error:
+            plugnimBuildStatus = "failed"
+            plugnimLastError = error.msg
+            false
+
+        proc `pollPluginBuild`(): bool =
+          if not `buildActive` or `compileRunning`(`buildProcess`):
+            return false
+          let finished = `finishCompile`(`buildProcess`)
+          `buildActive` = false
+          plugnimLastOutput = finished.output
+          if finished.output.len > 0:
+            stdout.write finished.output
+          if finished.exitCode == 0:
+            `readyPath` = `buildPath`
+            `buildPath` = ""
+            plugnimLastError = ""
+            plugnimBuildStatus = "ready"
+            true
+          else:
+            plugnimLastError = finished.output
+            plugnimBuildStatus = "failed"
+            echo "plugnim: could not compile plugin '", `id`,
+              "' (see the nim errors above)."
+            echo "         source: ", `src`
+            echo "         if this was a reload, the previously loaded version stays active."
+            true
+
+        proc `hasActiveBuild`(): bool =
+          `buildActive`
+
+        proc `hasReadyBuild`(): bool =
+          `readyPath`.len > 0
+
+        proc `activateReadyPlugin`(): bool =
+          if `readyPath`.len == 0:
+            return false
+          let path = `readyPath`
+          `readyPath` = ""
+          if `activatePlugin`(path):
+            plugnimBuildStatus = "idle"
+            true
+          else:
+            plugnimBuildStatus = "failed"
+            false
 
         if not `loadPlugin`():
           quit "plugnim: could not load dynamic plugin '" & `id` & "' at startup."
@@ -372,14 +739,38 @@ macro loadDynamicPlugins*(): untyped =
       reloadBranches.add nnkOfBranch.newTree(
         id,
         quote do:
-          discard `loadPlugin`(),
+          return `loadPlugin`(),
       )
+      startBuildBranches.add nnkOfBranch.newTree(
+        id,
+        quote do:
+          return `startPluginBuild`(),
+      )
+      pollBuildCalls.add quote do:
+        result = `pollPluginBuild`() or result
+      activeBuildChecks.add quote do:
+        if `hasActiveBuild`():
+          return true
+      readyBuildChecks.add quote do:
+        if `hasReadyBuild`():
+          return true
+      activateReadyCalls.add quote do:
+        result = `activateReadyPlugin`() or result
 
     if reloadBranches.len > 0:
       var dispatch = nnkCaseStmt.newTree(ident"pluginId")
+      var startBuildDispatch = nnkCaseStmt.newTree(ident"pluginId")
       for branch in reloadBranches:
         dispatch.add branch
+      for branch in startBuildBranches:
+        startBuildDispatch.add branch
       dispatch.add nnkElse.newTree(
+        quote do:
+          raise newException(
+            ValueError, "plugnim: no dynamic plugin named '" & pluginId & "'"
+          )
+      )
+      startBuildDispatch.add nnkElse.newTree(
         quote do:
           raise newException(
             ValueError, "plugnim: no dynamic plugin named '" & pluginId & "'"
@@ -387,8 +778,156 @@ macro loadDynamicPlugins*(): untyped =
       )
       result.add newProc(
         exported"reloadDynamicPlugin",
-        [newEmptyNode(), newIdentDefs(ident"pluginId", ident"string")],
+        [ident"bool", newIdentDefs(ident"pluginId", ident"string")],
         newStmtList(dispatch),
+      )
+      result.add newProc(
+        ident"startDynamicPluginBuild",
+        [ident"bool", newIdentDefs(ident"pluginId", ident"string")],
+        newStmtList(startBuildDispatch),
+      )
+    else:
+      result.add quote do:
+        proc reloadDynamicPlugin*(pluginId: string): bool =
+          raise newException(
+            ValueError, "plugnim: no dynamic plugin named '" & pluginId & "'"
+          )
+        proc startDynamicPluginBuild(pluginId: string): bool =
+          raise newException(
+            ValueError, "plugnim: no dynamic plugin named '" & pluginId & "'"
+          )
+
+    let pluginList = newLit(pluginIds.join("\n"))
+    let watchedPluginType = genSym(nskType, "PlugnimWatchedPlugin")
+    var watchedPluginInitializers = nnkBracket.newTree()
+    for (pluginId, file) in watchedDynamicPluginEntries():
+      let id = newLit pluginId
+      let sourceFile = newLit file
+      watchedPluginInitializers.add quote do:
+        `watchedPluginType`(
+          pluginId: `id`,
+          sourceFile: `sourceFile`,
+          lastStamp: plugnimSourceStamp(`sourceFile`),
+          pendingStamp: "",
+          pendingSince: 0.0,
+        )
+    var pollBuildsBody = newStmtList()
+    for call in pollBuildCalls:
+      pollBuildsBody.add call
+    var activeBuildsBody = newStmtList()
+    for check in activeBuildChecks:
+      activeBuildsBody.add check
+    activeBuildsBody.add quote do:
+      discard
+    var readyBuildsBody = newStmtList()
+    for check in readyBuildChecks:
+      readyBuildsBody.add check
+    readyBuildsBody.add quote do:
+      discard
+    var activateReadyBody = newStmtList()
+    for call in activateReadyCalls:
+      activateReadyBody.add call
+    result.add quote do:
+      type `watchedPluginType` = object
+        pluginId: string
+        sourceFile: string
+        lastStamp: string
+        pendingStamp: string
+        pendingSince: float
+
+      var plugnimPendingReloads {.inject.}: seq[string]
+
+      proc plugnimSourceStamp(path: string): string =
+        try:
+          $getLastModificationTime(path)
+        except OSError:
+          ""
+
+      var plugnimWatchedPlugins: seq[`watchedPluginType`] = @`watchedPluginInitializers`
+
+      proc queueDynamicPluginReload(pluginId: string): bool =
+        if pluginId notin plugnimPendingReloads:
+          plugnimPendingReloads.add pluginId
+        true
+
+      proc pollDynamicPluginWatchers(): bool =
+        let now = epochTime()
+        for watcher in plugnimWatchedPlugins.mitems:
+          let stamp = plugnimSourceStamp(watcher.sourceFile)
+          if stamp.len == 0:
+            continue
+          if stamp != watcher.lastStamp and stamp != watcher.pendingStamp:
+            watcher.pendingStamp = stamp
+            watcher.pendingSince = now
+          if watcher.pendingStamp.len > 0 and
+              watcher.pendingStamp != watcher.lastStamp and
+              now - watcher.pendingSince >= pluginWatchDebounceSeconds:
+            watcher.lastStamp = watcher.pendingStamp
+            watcher.pendingStamp = ""
+            discard queueDynamicPluginReload(watcher.pluginId)
+            result = true
+
+      proc hasPendingDynamicPluginReloads(): bool =
+        plugnimPendingReloads.len > 0
+
+      proc hasActiveDynamicPluginBuilds(): bool =
+        `activeBuildsBody`
+
+      proc pollDynamicPluginBuilds(): bool =
+        `pollBuildsBody`
+
+      proc hasReadyDynamicPluginReloads(): bool =
+        `readyBuildsBody`
+
+      proc activateReadyDynamicPluginReloads(): bool =
+        `activateReadyBody`
+
+      proc processDynamicPluginReloads(): bool =
+        if plugnimPendingReloads.len == 0:
+          return
+        let pending = plugnimPendingReloads
+        plugnimPendingReloads.setLen 0
+        for pluginId in pending:
+          try:
+            result = startDynamicPluginBuild(pluginId) or result
+          except CatchableError as error:
+            plugnimLastError = error.msg
+
+      proc plugnimListPluginsCallback(): cstring {.cdecl.} =
+        `pluginList`.cstring
+
+      proc plugnimReloadPluginCallback(pluginId: cstring): bool {.cdecl.} =
+        try:
+          queueDynamicPluginReload($pluginId)
+        except CatchableError as error:
+          plugnimLastError = error.msg
+          false
+
+      proc plugnimBuildStatusCallback(): cstring {.cdecl.} =
+        plugnimBuildStatus.cstring
+
+      proc plugnimRequestFrameCallback() {.cdecl.} =
+        plugnimRuntimeFrameRequested = true
+
+      proc plugnimSetWidgetTextControlCallback(id: uint64,
+          text: cstring) {.cdecl.} =
+        if not plugnimSetWidgetTextCallback.isNil:
+          plugnimSetWidgetTextCallback(id, text)
+
+      proc plugnimLastOutputCallback(): cstring {.cdecl.} =
+        plugnimLastOutput.cstring
+
+      proc plugnimLastErrorCallback(): cstring {.cdecl.} =
+        plugnimLastError.cstring
+
+      let plugnimPluginControls {.inject.} = PluginControls(
+        listPlugins: plugnimListPluginsCallback,
+        reloadPlugin: plugnimReloadPluginCallback,
+        requestFrame: plugnimRequestFrameCallback,
+        setWidgetText: plugnimSetWidgetTextControlCallback,
+        buildStatus: plugnimBuildStatusCallback,
+        lastOutput: plugnimLastOutputCallback,
+        lastError: plugnimLastErrorCallback,
       )
 
 macro generatePluginFunctionCalls*(functionName: untyped): untyped =
@@ -404,10 +943,9 @@ macro generatePluginFunctionCalls*(functionName: untyped): untyped =
       #   "  known plugin functions: " & (if known.len == 0: "(none)" else: known.join(", ")), functionName
       return
 
-    let ctx = genSym(nskVar, "context")
     var calls: seq[tuple[order: int, call: NimNode]]
-    var contextFieldNames: seq[string]
     var hasDynamic = false
+    var usesControls = false
 
     for p in plugins(StaticPlugins):
       if p.functionName != wanted:
@@ -416,13 +954,33 @@ macro generatePluginFunctionCalls*(functionName: untyped): untyped =
       var call = newCall(ident symbolName(p.pluginId, p.functionName))
       var used: seq[string]
       for (name, _) in pluginParams(p.def):
-        call.add ident(name)
+        if name == pluginControlsField:
+          usesControls = true
+          call.add ident"plugnimPluginControls"
+        else:
+          call.add ident(name)
         if name in states and name notin used:
           used.add name
       if used.len == 0:
         calls.add (p.order, call)
       else:
         var body = newStmtList()
+        var fallbackCall = newCall(ident symbolName(p.pluginId, p.functionName))
+        var copyable = newLit true
+        for (name, _) in pluginParams(p.def):
+          if name == pluginControlsField:
+            usesControls = true
+            fallbackCall.add ident"plugnimPluginControls"
+          elif name in states:
+            let stateVar = ident stateVarName(p.pluginId, name)
+            fallbackCall.add stateVar
+            copyable = infix(
+              copyable,
+              "and",
+              newCall(ident"compiles", newCall(ident"`=copy`", stateVar, stateVar)),
+            )
+          else:
+            fallbackCall.add ident name
         for name in used:
           let local = ident name
           let stateVar = ident stateVarName(p.pluginId, name)
@@ -434,33 +992,56 @@ macro generatePluginFunctionCalls*(functionName: untyped): untyped =
           let stateVar = ident stateVarName(p.pluginId, name)
           body.add quote do:
             `stateVar` = `local`
-        calls.add (p.order, nnkBlockStmt.newTree(newEmptyNode(), body))
+        let copyBlock = nnkBlockStmt.newTree(newEmptyNode(), body)
+        calls.add (p.order, quote do:
+          when `copyable`:
+            `copyBlock`
+          else:
+            `fallbackCall`
+        )
 
     for p in plugins(DynamicPlugins):
       if p.functionName != wanted:
         continue
       hasDynamic = true
+      let ctx = genSym(nskVar, "context")
+      let checkCtx = genSym(nskVar, "checkContext")
+      let controlsField = ident pluginControlsField
+      var assignments = newStmtList()
+      var checkAssignments = newStmtList()
+      assignments.add newAssignment(
+        newDotExpr(ctx, controlsField), ident"plugnimPluginControls"
+      )
       for (name, _) in pluginParams(p.def):
-        if name notin contextFieldNames:
-          contextFieldNames.add name
+        if name == pluginControlsField:
+          continue
+        let local = ident name
+        assignments.add newAssignment(
+          newDotExpr(ctx, local), newCall(ident"unsafeAddr", local)
+        )
+        checkAssignments.add newAssignment(
+          newDotExpr(checkCtx, local), newCall(ident"unsafeAddr", local)
+        )
       let fnPointer = ident pointerName(p.pluginId, p.functionName)
-      calls.add (p.order, newCall(fnPointer, newCall(ident"addr", ctx)))
+      let call = newCall(fnPointer, newCall(ident"addr", ctx))
+      calls.add (p.order, quote do:
+        when compiles(block:
+          var `checkCtx`: PluginContext
+          `checkAssignments`
+        ):
+          block:
+            var `ctx`: PluginContext
+            `assignments`
+            `call`
+      )
 
     if hasDynamic and ContextGenerated.len == 0:
       error "generatePluginFunctionCalls(" & wanted & ") needs the plugin context, but\n" &
         "  generatePluginContext() has not been called yet. Call it once after your plugin\n" &
         "  blocks and before generating any calls."
 
-    if hasDynamic:
-      result.add quote do:
-        var `ctx`: PluginContext
-      for name in contextFieldNames:
-        let local = ident name
-        result.add newAssignment(newDotExpr(ctx, local), local)
-
     for entry in calls.sortedByIt(it.order):
       result.add entry.call
-
 when isMainModule:
   plugin ABC:
     var banana = 42

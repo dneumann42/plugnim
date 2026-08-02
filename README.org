@@ -31,8 +31,8 @@ plugin EntityCollisionDetection:
       return
     # ...
 
-# Adding dynamic will make this plugin built in its own compilation unit, a dynamic library
-# for the host system will be produced, it will be loaded at runtime
+# adding 'dynamic' will cause the plugin to be built in a dynamic library
+# for the platform, the library is loaded at runtime
 plugin MyDynamicPlugin, dynamic:
   # dt is defined at the call site of the 'draw' step, so we can pull it in as
   # an argument to draw, order: -1 means that this draw runs before all others,
