@@ -212,6 +212,9 @@ func contextFieldType(typ: NimNode): NimNode =
   else:
     copyNimTree(typ)
 
+func contextFieldSignature(name: string, typ: NimNode): string =
+  name & ":" & contextFieldType(typ).repr
+
 func contextPtrTo(typ: NimNode): NimNode =
   nnkPtrTy.newTree(contextFieldType(typ))
 
@@ -332,7 +335,7 @@ proc contextFields(): seq[tuple[name: string, typ: NimNode, plugin: string]] =
       for existing in result:
         if existing.name == name:
           known = true
-          if existing.typ.repr != typ.repr:
+          if contextFieldType(existing.typ).repr != contextFieldType(typ).repr:
             error "dynamic plugins disagree on the type of shared state '" & name &
               "'.\n" & "  plugin '" & existing.plugin & "' declares it as " &
               existing.typ.repr & "\n" & "  plugin '" & p.pluginId & "' declares it as " &
@@ -418,7 +421,7 @@ macro plugin*(identifier, flag, body: untyped): untyped =
       for field in ctxFields:
         fields.add newIdentDefs(exported field.name, contextPtrTo(field.typ))
 
-      let signature = newLit ctxFields.mapIt(it.name & ":" & it.typ.repr).join(";")
+      let signature = newLit ctxFields.mapIt(contextFieldSignature(it.name, it.typ)).join(";")
       result.add nnkTypeSection.newTree(
         nnkTypeDef.newTree(
           exported"PluginContext",
@@ -500,7 +503,7 @@ macro generatePluginContext*(): untyped =
   for field in ctxFields:
     fields.add newIdentDefs(exported field.name, contextPtrTo(field.typ))
 
-  let signature = newLit ctxFields.mapIt(it.name & ":" & it.typ.repr).join(";")
+  let signature = newLit ctxFields.mapIt(contextFieldSignature(it.name, it.typ)).join(";")
 
   result = newStmtList(
     nnkTypeSection.newTree(
@@ -669,8 +672,10 @@ macro loadDynamicPlugins*(): untyped =
             `closeLib`(`candidate`)
             return false
           `resolves`
+          let oldLib = `lib`
           `lib` = `candidate`
           `assigns`
+          `closeLib`(oldLib)
           inc `version`
           true
 
@@ -1087,4 +1092,3 @@ when isMainModule:
 
     expandMacros:
       generatePluginFunctionCalls(update)
-
