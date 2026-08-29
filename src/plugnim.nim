@@ -22,6 +22,7 @@ const
   plugnimPluginId {.strdefine.} = ""
   pluginControlsField = "pluginControls"
   pluginWatchDebounceSeconds = 0.25
+  pluginWatchScanSeconds = 0.25
 
 const isDynamicPluginBuild* = plugnimPluginId.len > 0
 
@@ -819,6 +820,7 @@ macro loadDynamicPlugins*(): untyped =
           lastStamp: plugnimSourceStamp(`sourceFile`),
           pendingStamp: "",
           pendingSince: 0.0,
+          lastScan: 0.0,
         )
     var pollBuildsBody = newStmtList()
     for call in pollBuildCalls:
@@ -843,14 +845,40 @@ macro loadDynamicPlugins*(): untyped =
         lastStamp: string
         pendingStamp: string
         pendingSince: float
+        lastScan: float
 
       var plugnimPendingReloads {.inject.}: seq[string]
 
+      proc plugnimWatchRoot(path: string): string =
+        var dir = path.parentDir
+        result = dir
+        while dir.len > 0:
+          if dir.lastPathPart == "src":
+            return dir
+          let parent = dir.parentDir
+          if parent == dir:
+            break
+          dir = parent
+
       proc plugnimSourceStamp(path: string): string =
+        let root = plugnimWatchRoot(path)
+        var entries: seq[string]
         try:
-          $getLastModificationTime(path)
+          for file in walkDirRec(root):
+            if file.endsWith(".nim") or file.endsWith(".nims"):
+              try:
+                entries.add file & ":" & $getLastModificationTime(file)
+              except OSError:
+                discard
         except OSError:
-          ""
+          discard
+        if entries.len == 0:
+          try:
+            entries.add path & ":" & $getLastModificationTime(path)
+          except OSError:
+            discard
+        entries.sort()
+        entries.join("\n")
 
       var plugnimWatchedPlugins: seq[`watchedPluginType`] = @`watchedPluginInitializers`
 
@@ -862,6 +890,9 @@ macro loadDynamicPlugins*(): untyped =
       proc pollDynamicPluginWatchers(): bool =
         let now = epochTime()
         for watcher in plugnimWatchedPlugins.mitems:
+          if now - watcher.lastScan < pluginWatchScanSeconds:
+            continue
+          watcher.lastScan = now
           let stamp = plugnimSourceStamp(watcher.sourceFile)
           if stamp.len == 0:
             continue
