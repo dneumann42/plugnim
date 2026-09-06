@@ -2,4 +2,7 @@
 nimble.develop
 nimble.paths
 nimbledeps
+/deps/
+/nim.cfg
+/deps.dot
 libplugnim*
