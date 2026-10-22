@@ -372,7 +372,8 @@ macro plugin*(identifier, body: untyped): untyped =
       var emitted = nnkProcDef.newTree()
       for child in item:
         emitted.add copyNimTree(child)
-      emitted.name = ident symbolName(identifier.strVal, item.name.strVal)
+      emitted.name = newTree(nnkPostfix, ident"*",
+        ident symbolName(identifier.strVal, item.name.strVal))
       var hasControlsParam = false
       for (name, _) in pluginParams(item):
         if name == pluginControlsField:
@@ -395,7 +396,7 @@ macro plugin*(identifier, body: untyped): untyped =
           registerState(identifier.strVal, name)
           result.add nnkVarSection.newTree(
             newIdentDefs(
-              ident stateVarName(identifier.strVal, name),
+              newTree(nnkPostfix, ident"*", ident stateVarName(identifier.strVal, name)),
               copyNimTree(def[^2]),
               copyNimTree(def[^1]),
             )
