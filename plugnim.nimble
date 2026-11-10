@@ -10,4 +10,4 @@ bin           = @["plugnim"]
 
 # Dependencies
 
-requires "nim >= 2.2.10"
+requires "nim >= 2.4.0"

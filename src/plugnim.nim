@@ -3,6 +3,13 @@ import std/[
   streams, times,
 ]
 
+## Everything plugnim defines and generates is GC-safe: plugin functions are
+## called through the generated dispatchers, so if plugnim's own state or
+## emitted code were not gcsafe, every host routine touching it would be
+## flagged `not GC-safe` too.
+
+{.push gcsafe.}
+
 const
   StaticPlugins = CacheSeq"plugnim.static"
   DynamicPlugins = CacheSeq"plugnim.dynamic"
@@ -27,21 +34,26 @@ const
 const isDynamicPluginBuild* = plugnimPluginId.len > 0
 
 type PluginControls* = object
-  listPlugins*: proc(): cstring {.cdecl.}
-  reloadPlugin*: proc(pluginId: cstring): bool {.cdecl.}
-  requestFrame*: proc() {.cdecl.}
-  setWidgetText*: proc(id: uint64, text: cstring) {.cdecl.}
-  buildStatus*: proc(): cstring {.cdecl.}
-  lastOutput*: proc(): cstring {.cdecl.}
-  lastError*: proc(): cstring {.cdecl.}
+  listPlugins*: proc(): cstring {.cdecl, gcsafe.}
+  reloadPlugin*: proc(pluginId: cstring): bool {.cdecl, gcsafe.}
+  requestFrame*: proc() {.cdecl, gcsafe.}
+  setWidgetText*: proc(id: uint64, text: cstring) {.cdecl, gcsafe.}
+  buildStatus*: proc(): cstring {.cdecl, gcsafe.}
+  lastOutput*: proc(): cstring {.cdecl, gcsafe.}
+  lastError*: proc(): cstring {.cdecl, gcsafe.}
 
 var
-  plugnimLastOutput* = ""
-  plugnimLastError* = ""
-  plugnimBuildStatus* = "idle"
-  plugnimRuntimeFrameRequested* = false
+  plugnimLastOutput* {.threadvar.}: string
+  plugnimLastError* {.threadvar.}: string
+  plugnimBuildStatus* {.threadvar.}: string
+  plugnimRuntimeFrameRequested* {.threadvar.}: bool
   plugnimSetWidgetTextCallback*:
-    proc(id: uint64, text: cstring) {.cdecl.}
+    proc(id: uint64, text: cstring) {.cdecl, gcsafe.}
+
+plugnimLastOutput = ""
+plugnimLastError = ""
+plugnimBuildStatus = "idle"
+plugnimRuntimeFrameRequested = false
 
 proc plugins*(controls: PluginControls): seq[string] =
   if controls.listPlugins.isNil:
@@ -169,7 +181,7 @@ proc pluginLibSignature*(lib: LibHandle): string =
   let symbol = lib.symAddr(contextSignatureSymbol)
   if symbol.isNil:
     return ""
-  $cast[proc(): cstring {.cdecl.}](symbol)()
+  $cast[proc(): cstring {.cdecl, gcsafe.}](symbol)()
 
 proc checkPluginSignature(pluginId: string, lib: LibHandle, expected: string): bool =
   let actual = pluginLibSignature(lib)
@@ -219,12 +231,32 @@ func contextFieldSignature(name: string, typ: NimNode): string =
 func contextPtrTo(typ: NimNode): NimNode =
   nnkPtrTy.newTree(contextFieldType(typ))
 
-iterator pluginParams(procDef: NimNode): tuple[name: string, typ: NimNode] =
-  let formalParams = procDef.params
-  for i in 1 ..< formalParams.len:
-    let defs = formalParams[i]
-    for j in 0 ..< defs.len - 2:
-      yield (defs[j].strVal, defs[^2])
+func threadVarSection(name, typ, init: NimNode): NimNode =
+  ## A thread-local variable: thread vars can't carry an initializer in the
+  ## declaration, so this emits the pragma-wrapped name plus a module-level
+  ## `name = init` statement (the parser's var form: pragmaExpr, type, val).
+  let pragmaName = nnkPragmaExpr.newTree(
+    copyNimTree(name), nnkPragma.newTree(ident"threadvar"))
+  let declaredType =
+    if typ.kind == nnkEmpty: nnkTypeOfExpr.newTree(copyNimTree(init))
+    else: copyNimTree(typ)
+  result = newStmtList(nnkVarSection.newTree(
+    nnkIdentDefs.newTree(pragmaName, declaredType, newEmptyNode())))
+  if init.kind != nnkEmpty:
+    let target =
+      if name.kind == nnkPostfix: name[1]
+      else: name
+    result.add newAssignment(ident(target.strVal), copyNimTree(init))
+
+template pluginParams(procDef: NimNode): seq[tuple[name: string, typ: NimNode]] =
+  block:
+    var res: seq[tuple[name: string, typ: NimNode]]
+    let formalParams = procDef.params
+    for i in 1 ..< formalParams.len:
+      let defs = formalParams[i]
+      for j in 0 ..< defs.len - 2:
+        res.add((defs[j].strVal, defs[^2]))
+    res
 
 proc extractOrder(procDef: NimNode): int =
   let pragmas = procDef.pragma
@@ -243,50 +275,78 @@ proc extractOrder(procDef: NimNode): int =
   if pragmas.len == 0:
     procDef.pragma = newEmptyNode()
 
-proc register(cache: CacheSeq, identifier, procDef: NimNode) =
-  let order = extractOrder(procDef)
+template register(cache: CacheSeq, identifier, procDef: NimNode) =
   cache.add nnkPar.newTree(
     newLit identifier.strVal,
     newLit identifier.lineInfoObj.filename,
-    newLit order,
+    newLit extractOrder(procDef),
     procDef,
   )
 
-proc registerState(pluginId, name: string) =
+template registerState(pluginId, name: string) =
   PluginStates.add nnkPar.newTree(newLit pluginId, newLit name)
 
-proc registerWatchedDynamicPlugin(identifier: NimNode) =
-  for entry in WatchedDynamicPlugins:
-    if entry[0].strVal == identifier.strVal:
-      return
-  WatchedDynamicPlugins.add nnkPar.newTree(
-    newLit identifier.strVal,
-    newLit identifier.lineInfoObj.filename,
-  )
+template registerWatchedDynamicPlugin(identifier: NimNode) =
+  block:
+    var already = false
+    var idx = 0
+    while idx < WatchedDynamicPlugins.len:
+      let entry = WatchedDynamicPlugins[idx]
+      inc idx
+      if entry[0].strVal == identifier.strVal:
+        already = true
+        break
+    if not already:
+      WatchedDynamicPlugins.add nnkPar.newTree(
+        newLit identifier.strVal,
+        newLit identifier.lineInfoObj.filename,
+      )
 
-proc isWatchedDynamicPlugin(pluginId: string): bool =
-  for entry in WatchedDynamicPlugins:
-    if entry[0].strVal == pluginId:
-      return true
+template isWatchedDynamicPlugin(pluginId: string): bool =
+  block:
+    var found = false
+    var idx = 0
+    while idx < WatchedDynamicPlugins.len:
+      let entry = WatchedDynamicPlugins[idx]
+      inc idx
+      if entry[0].strVal == pluginId:
+        found = true
+        break
+    found
 
-proc pluginStateNames(pluginId: string): seq[string] =
-  for entry in PluginStates:
-    if entry[0].strVal == pluginId:
-      result.add entry[1].strVal
+template pluginStateNames(pluginId: string): seq[string] =
+  block:
+    var res: seq[string]
+    var idx = 0
+    while idx < PluginStates.len:
+      let entry = PluginStates[idx]
+      inc idx
+      if entry[0].strVal == pluginId:
+        res.add entry[1].strVal
+    res
 
-iterator plugins(
+template plugins(
     cache: CacheSeq
-): tuple[pluginId, functionName, file: string, order: int, def: NimNode] =
-  for entry in cache:
-    let def = entry[3]
-    yield (entry[0].strVal, def.name.strVal, entry[1].strVal, int(entry[2].intVal), def)
+): seq[tuple[pluginId, functionName, file: string, order: int, def: NimNode]] =
+  block:
+    var res: seq[tuple[pluginId, functionName, file: string, order: int, def: NimNode]]
+    var idx = 0
+    while idx < cache.len:
+      let entry = cache[idx]
+      inc idx
+      let def = entry[3]
+      res.add((entry[0].strVal, def.name.strVal, entry[1].strVal, int(entry[2].intVal), def))
+    res
 
-iterator dynamicPluginFiles(): tuple[pluginId, file: string] =
-  var seen: seq[string]
-  for p in plugins(DynamicPlugins):
-    if p.pluginId notin seen:
-      seen.add p.pluginId
-      yield (p.pluginId, p.file)
+template dynamicPluginFiles(): seq[tuple[pluginId, file: string]] =
+  block:
+    var res: seq[tuple[pluginId, file: string]]
+    var seen: seq[string]
+    for p in plugins(DynamicPlugins):
+      if p.pluginId notin seen:
+        seen.add p.pluginId
+        res.add((p.pluginId, p.file))
+    res
 
 proc expectPluginBody(identifier, body: NimNode)
 proc expectPluginProc(identifier, node: NimNode)
@@ -311,40 +371,48 @@ proc validateDynamicPlugin(identifier, body: NimNode) =
         "  pointers, so they can't return a value. Communicate results through plugin state\n" &
         "  (a parameter), which becomes part of the generated context.", item.params[0]
 
-proc registerDynamicPlugin(identifier, body: NimNode) =
+template registerDynamicPlugin(identifier, body: NimNode) =
   for item in body:
     register(DynamicPlugins, identifier, item)
 
-proc watchedDynamicPluginEntries(): seq[tuple[pluginId, file: string]] =
-  for (pluginId, file) in dynamicPluginFiles():
-    if pluginId.isWatchedDynamicPlugin:
-      result.add (pluginId, file)
+template watchedDynamicPluginEntries(): seq[tuple[pluginId, file: string]] =
+  block:
+    var res: seq[tuple[pluginId, file: string]]
+    for (pluginId, file) in dynamicPluginFiles():
+      if pluginId.isWatchedDynamicPlugin:
+        res.add (pluginId, file)
+    res
 
-proc knownFunctionNames(): seq[string] =
-  for p in plugins(StaticPlugins):
-    result.add p.functionName
-  for p in plugins(DynamicPlugins):
-    result.add p.functionName
-  result = result.deduplicate
+template knownFunctionNames(): seq[string] =
+  block:
+    var res: seq[string]
+    for p in plugins(StaticPlugins):
+      res.add p.functionName
+    for p in plugins(DynamicPlugins):
+      res.add p.functionName
+    res.deduplicate
 
-proc contextFields(): seq[tuple[name: string, typ: NimNode, plugin: string]] =
-  for p in plugins(DynamicPlugins):
-    for (name, typ) in pluginParams(p.def):
-      if name == pluginControlsField:
-        continue
-      var known = false
-      for existing in result:
-        if existing.name == name:
-          known = true
-          if contextFieldType(existing.typ).repr != contextFieldType(typ).repr:
-            error "dynamic plugins disagree on the type of shared state '" & name &
-              "'.\n" & "  plugin '" & existing.plugin & "' declares it as " &
-              existing.typ.repr & "\n" & "  plugin '" & p.pluginId & "' declares it as " &
-              typ.repr & "\n" &
-              "  All dynamic plugins share one context object, so each state name must have\n" &
-              "  a single consistent type across every plugin.", typ
-      if not known:
-        result.add (name, typ, p.pluginId)
+template contextFields(): seq[tuple[name: string, typ: NimNode, plugin: string]] =
+  block:
+    var res: seq[tuple[name: string, typ: NimNode, plugin: string]]
+    for p in plugins(DynamicPlugins):
+      for (name, typ) in pluginParams(p.def):
+        if name == pluginControlsField:
+          continue
+        var known = false
+        for existing in res:
+          if existing.name == name:
+            known = true
+            if contextFieldType(existing.typ).repr != contextFieldType(typ).repr:
+              error "dynamic plugins disagree on the type of shared state '" & name &
+                "'.\n" & "  plugin '" & existing.plugin & "' declares it as " &
+                existing.typ.repr & "\n" & "  plugin '" & p.pluginId & "' declares it as " &
+                typ.repr & "\n" &
+                "  All dynamic plugins share one context object, so each state name must have\n" &
+                "  a single consistent type across every plugin.", typ
+        if not known:
+          res.add (name, typ, p.pluginId)
+    res
 
 proc expectPluginBody(identifier, body: NimNode) =
   if identifier.kind != nnkIdent:
@@ -394,12 +462,10 @@ macro plugin*(identifier, body: untyped): untyped =
         for i in 0 ..< def.len - 2:
           let name = def[i].strVal
           registerState(identifier.strVal, name)
-          result.add nnkVarSection.newTree(
-            newIdentDefs(
-              newTree(nnkPostfix, ident"*", ident stateVarName(identifier.strVal, name)),
-              copyNimTree(def[^2]),
-              copyNimTree(def[^1]),
-            )
+          result.add threadVarSection(
+            newTree(nnkPostfix, ident"*", ident stateVarName(identifier.strVal, name)),
+            copyNimTree(def[^2]),
+            copyNimTree(def[^1]),
           )
     else:
       error "plugin '" & identifier.strVal & "' may only contain proc definitions and\n" &
@@ -437,7 +503,7 @@ macro plugin*(identifier, flag, body: untyped): untyped =
             nnkFormalParams.newTree(
               newEmptyNode(), newIdentDefs(ident"context", ptrTo"PluginContext")
             ),
-            nnkPragma.newTree(ident"cdecl"),
+            nnkPragma.newTree(ident"cdecl", ident"gcsafe"),
           ),
         ),
       )
@@ -447,7 +513,7 @@ macro plugin*(identifier, flag, body: untyped): untyped =
 
       let getter = ident contextSignatureSymbol
       result.add quote do:
-        proc `getter`(): cstring {.exportc, dynlib, cdecl.} =
+        proc `getter`(): cstring {.exportc, dynlib, cdecl, gcsafe.} =
           pluginContextSignature.cstring
 
       let ctx = ident"plugnimContext"
@@ -482,7 +548,7 @@ macro plugin*(identifier, flag, body: untyped): untyped =
         procBody.add copyNimTree(item.body)
         let sym = ident symbolName(identifier.strVal, item.name.strVal)
         result.add quote do:
-          proc `sym`(`ctx`: ptr PluginContext) {.exportc, dynlib, cdecl.} =
+          proc `sym`(`ctx`: ptr PluginContext) {.exportc, dynlib, cdecl, gcsafe.} =
             `procBody`
 
 macro plugin*(identifier, flag, watchFlag, body: untyped): untyped =
@@ -521,7 +587,7 @@ macro generatePluginContext*(): untyped =
           nnkFormalParams.newTree(
             newEmptyNode(), newIdentDefs(ident"context", ptrTo"PluginContext")
           ),
-          nnkPragma.newTree(ident"cdecl"),
+          nnkPragma.newTree(ident"cdecl", ident"gcsafe"),
         ),
       ),
     )
@@ -534,7 +600,7 @@ macro generatePluginContext*(): untyped =
   when plugnimPluginId.len == 0:
     if DynamicPlugins.len > 0:
       result.add quote do:
-        proc plugnimNoopPluginFunction(context: ptr PluginContext) {.cdecl.} =
+        proc plugnimNoopPluginFunction(context: ptr PluginContext) {.cdecl, gcsafe.} =
           discard
 
       var declaredPointers: seq[string]
@@ -549,7 +615,7 @@ macro generatePluginContext*(): untyped =
   else:
     let getter = ident contextSignatureSymbol
     result.add quote do:
-      proc `getter`(): cstring {.exportc, dynlib, cdecl.} =
+      proc `getter`(): cstring {.exportc, dynlib, cdecl, gcsafe.} =
         pluginContextSignature.cstring
 
     let ctx = ident"plugnimContext"
@@ -586,7 +652,7 @@ macro generatePluginContext*(): untyped =
       body.add copyNimTree(p.def.body)
       let sym = ident symbolName(p.pluginId, p.functionName)
       result.add quote do:
-        proc `sym`(`ctx`: ptr PluginContext) {.exportc, dynlib, cdecl.} =
+        proc `sym`(`ctx`: ptr PluginContext) {.exportc, dynlib, cdecl, gcsafe.} =
           `body`
 
 macro loadDynamicPlugins*(): untyped =
@@ -658,14 +724,14 @@ macro loadDynamicPlugins*(): untyped =
           `fnPointer` = cast[PluginFunction](`resolved`)
 
       result.add quote do:
-        var `lib`: LibHandle
-        var `version` = 0
-        var `buildProcess`: Process
-        var `buildPath` = ""
-        var `buildActive` = false
-        var `readyPath` = ""
+        var `lib` {.threadvar.}: LibHandle
+        var `version` {.threadvar.}: int
+        var `buildProcess` {.threadvar.}: Process
+        var `buildPath` {.threadvar.}: string
+        var `buildActive` {.threadvar.}: bool
+        var `readyPath` {.threadvar.}: string
 
-        proc `activatePlugin`(`pathParam`: string): bool =
+        proc `activatePlugin`(`pathParam`: string): bool {.gcsafe.} =
           let `candidate` = `openLib`(`pathParam`)
           if `candidate`.isNil:
             `reportOpen`(`id`, `pathParam`)
@@ -681,13 +747,13 @@ macro loadDynamicPlugins*(): untyped =
           inc `version`
           true
 
-        proc `loadPlugin`(): bool =
+        proc `loadPlugin`(): bool {.gcsafe.} =
           let `path` = `libPath`(`id`, `version`)
           if not `compile`(`id`, `src`, `path`):
             return false
           `activatePlugin`(`path`)
 
-        proc `startPluginBuild`(): bool =
+        proc `startPluginBuild`(): bool {.gcsafe.} =
           if `buildActive`:
             return false
           `buildPath` = `libPath`(`id`, `version`)
@@ -703,7 +769,7 @@ macro loadDynamicPlugins*(): untyped =
             plugnimLastError = error.msg
             false
 
-        proc `pollPluginBuild`(): bool =
+        proc `pollPluginBuild`(): bool {.gcsafe.} =
           if not `buildActive` or `compileRunning`(`buildProcess`):
             return false
           let finished = `finishCompile`(`buildProcess`)
@@ -726,13 +792,13 @@ macro loadDynamicPlugins*(): untyped =
             echo "         if this was a reload, the previously loaded version stays active."
             true
 
-        proc `hasActiveBuild`(): bool =
+        proc `hasActiveBuild`(): bool {.gcsafe.} =
           `buildActive`
 
-        proc `hasReadyBuild`(): bool =
+        proc `hasReadyBuild`(): bool {.gcsafe.} =
           `readyPath`.len > 0
 
-        proc `activateReadyPlugin`(): bool =
+        proc `activateReadyPlugin`(): bool {.gcsafe.} =
           if `readyPath`.len == 0:
             return false
           let path = `readyPath`
@@ -791,19 +857,21 @@ macro loadDynamicPlugins*(): untyped =
         exported"reloadDynamicPlugin",
         [ident"bool", newIdentDefs(ident"pluginId", ident"string")],
         newStmtList(dispatch),
+        pragmas = nnkPragma.newTree(ident"gcsafe"),
       )
       result.add newProc(
         ident"startDynamicPluginBuild",
         [ident"bool", newIdentDefs(ident"pluginId", ident"string")],
         newStmtList(startBuildDispatch),
+        pragmas = nnkPragma.newTree(ident"gcsafe"),
       )
     else:
       result.add quote do:
-        proc reloadDynamicPlugin*(pluginId: string): bool =
+        proc reloadDynamicPlugin*(pluginId: string): bool {.gcsafe.} =
           raise newException(
             ValueError, "plugnim: no dynamic plugin named '" & pluginId & "'"
           )
-        proc startDynamicPluginBuild(pluginId: string): bool =
+        proc startDynamicPluginBuild(pluginId: string): bool {.gcsafe.} =
           raise newException(
             ValueError, "plugnim: no dynamic plugin named '" & pluginId & "'"
           )
@@ -848,9 +916,9 @@ macro loadDynamicPlugins*(): untyped =
         pendingSince: float
         lastScan: float
 
-      var plugnimPendingReloads {.inject.}: seq[string]
+      var plugnimPendingReloads {.inject, threadvar.}: seq[string]
 
-      proc plugnimWatchRoot(path: string): string =
+      proc plugnimWatchRoot(path: string): string {.gcsafe.} =
         var dir = path.parentDir
         result = dir
         while dir.len > 0:
@@ -861,7 +929,7 @@ macro loadDynamicPlugins*(): untyped =
             break
           dir = parent
 
-      proc plugnimSourceStamp(path: string): string =
+      proc plugnimSourceStamp(path: string): string {.gcsafe.} =
         let root = plugnimWatchRoot(path)
         var entries: seq[string]
         try:
@@ -881,14 +949,15 @@ macro loadDynamicPlugins*(): untyped =
         entries.sort()
         entries.join("\n")
 
-      var plugnimWatchedPlugins: seq[`watchedPluginType`] = @`watchedPluginInitializers`
+      var plugnimWatchedPlugins {.threadvar.}: seq[`watchedPluginType`]
+      plugnimWatchedPlugins = @`watchedPluginInitializers`
 
-      proc queueDynamicPluginReload(pluginId: string): bool =
+      proc queueDynamicPluginReload(pluginId: string): bool {.gcsafe.} =
         if pluginId notin plugnimPendingReloads:
           plugnimPendingReloads.add pluginId
         true
 
-      proc pollDynamicPluginWatchers(): bool =
+      proc pollDynamicPluginWatchers(): bool {.gcsafe.} =
         let now = epochTime()
         for watcher in plugnimWatchedPlugins.mitems:
           if now - watcher.lastScan < pluginWatchScanSeconds:
@@ -908,22 +977,22 @@ macro loadDynamicPlugins*(): untyped =
             discard queueDynamicPluginReload(watcher.pluginId)
             result = true
 
-      proc hasPendingDynamicPluginReloads(): bool =
+      proc hasPendingDynamicPluginReloads(): bool {.gcsafe.} =
         plugnimPendingReloads.len > 0
 
-      proc hasActiveDynamicPluginBuilds(): bool =
+      proc hasActiveDynamicPluginBuilds(): bool {.gcsafe.} =
         `activeBuildsBody`
 
-      proc pollDynamicPluginBuilds(): bool =
+      proc pollDynamicPluginBuilds(): bool {.gcsafe.} =
         `pollBuildsBody`
 
-      proc hasReadyDynamicPluginReloads(): bool =
+      proc hasReadyDynamicPluginReloads(): bool {.gcsafe.} =
         `readyBuildsBody`
 
-      proc activateReadyDynamicPluginReloads(): bool =
+      proc activateReadyDynamicPluginReloads(): bool {.gcsafe.} =
         `activateReadyBody`
 
-      proc processDynamicPluginReloads(): bool =
+      proc processDynamicPluginReloads(): bool {.gcsafe.} =
         if plugnimPendingReloads.len == 0:
           return
         let pending = plugnimPendingReloads
@@ -934,31 +1003,31 @@ macro loadDynamicPlugins*(): untyped =
           except CatchableError as error:
             plugnimLastError = error.msg
 
-      proc plugnimListPluginsCallback(): cstring {.cdecl.} =
+      proc plugnimListPluginsCallback(): cstring {.cdecl, gcsafe.} =
         `pluginList`.cstring
 
-      proc plugnimReloadPluginCallback(pluginId: cstring): bool {.cdecl.} =
+      proc plugnimReloadPluginCallback(pluginId: cstring): bool {.cdecl, gcsafe.} =
         try:
           queueDynamicPluginReload($pluginId)
         except CatchableError as error:
           plugnimLastError = error.msg
           false
 
-      proc plugnimBuildStatusCallback(): cstring {.cdecl.} =
+      proc plugnimBuildStatusCallback(): cstring {.cdecl, gcsafe.} =
         plugnimBuildStatus.cstring
 
-      proc plugnimRequestFrameCallback() {.cdecl.} =
+      proc plugnimRequestFrameCallback() {.cdecl, gcsafe.} =
         plugnimRuntimeFrameRequested = true
 
       proc plugnimSetWidgetTextControlCallback(id: uint64,
-          text: cstring) {.cdecl.} =
+          text: cstring) {.cdecl, gcsafe.} =
         if not plugnimSetWidgetTextCallback.isNil:
           plugnimSetWidgetTextCallback(id, text)
 
-      proc plugnimLastOutputCallback(): cstring {.cdecl.} =
+      proc plugnimLastOutputCallback(): cstring {.cdecl, gcsafe.} =
         plugnimLastOutput.cstring
 
-      proc plugnimLastErrorCallback(): cstring {.cdecl.} =
+      proc plugnimLastErrorCallback(): cstring {.cdecl, gcsafe.} =
         plugnimLastError.cstring
 
       when not declared(plugnimPluginControls):
